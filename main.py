@@ -650,7 +650,7 @@ class TradingBot:
 
             # SL de sécurité à -5% sur l'exchange (protection si le bot plante)
             # Le trailing stop interne gère la sortie normale avant ce niveau
-            safety_sl_pct = 0.05
+            safety_sl_pct = 0.03
             if side == OrderSide.BUY:
                 safety_sl = round(fill * (1 - safety_sl_pct), 6)
             else:
