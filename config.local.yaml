@@ -7,4 +7,13 @@ risk:
 
 strategies:
   cycle_trader:
-    enabled: false              # désactivé temporairement (fiabilité trop faible)
+    enabled: true
+    min_reliability: 35         # abaissé de 40% à 35% pour débloquer les trades
+  btc_trend:
+    enabled: true
+    timeframe: "1h"
+    ema_periods: [20, 50, 200]
+    rsi_buy_min: 40
+    rsi_buy_max: 65
+    rsi_sell_min: 35
+    rsi_sell_max: 60

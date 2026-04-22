@@ -1,31 +1,58 @@
 bot:
-  mode: "paper"  # "paper" (simulation) or "live" (real trading)
-  update_interval: 60  # seconds between each analysis cycle
+  mode: "live"  # "paper" (simulation) ou "live" (vrai argent)
+  update_interval: 30  # 30 secondes entre chaque cycle
 
 risk:
-  max_risk_per_trade_pct: 1.0
-  max_drawdown_pct: 10.0
-  max_open_positions: 5
-  min_reward_risk_ratio: 2.0
+  max_risk_per_trade_pct: 5.0     # risquer 1% par trade max
+  max_drawdown_pct: 10.0          # drawdown max 10% avant arret
+  max_open_positions: 50          # pas de limite pratique
+  max_positions_per_symbol: 2     # 1 seule position par crypto
+  cooldown_minutes: 15            # 30 min entre trades sur meme symbole
+  max_leverage: 10                # max 10x
+  min_reward_risk_ratio: 1.5      # R:R minimum 1.5
+  trailing_stop_pct: 1.5          # trailing stop: SL suit le prix a 1.5% sous le pic
 
 trading_pairs:
   spot:
     - symbol: "BTC"
-      strategies: ["trend_following", "breakout"]
+      strategies: ["btc_trend", "momentum", "cycle_trader"]
     - symbol: "ETH"
-      strategies: ["mean_reversion"]
+      strategies: ["trend_following", "momentum", "cycle_trader"]
+    - symbol: "SOL"
+      strategies: ["momentum", "cycle_trader", "breakout"]
   perps:
     - symbol: "BTC"
-      leverage: 5
-      strategies: ["trend_following", "scalping"]
+      leverage: 3
+      strategies: ["btc_trend", "momentum", "cycle_trader"]
+    - symbol: "ETH"
+      leverage: 3
+      strategies: ["trend_following", "momentum", "cycle_trader"]
     - symbol: "SOL"
       leverage: 3
-      strategies: ["breakout", "mean_reversion"]
+      strategies: ["momentum", "cycle_trader", "breakout"]
+    - symbol: "XRP"
+      leverage: 3
+      strategies: ["momentum", "cycle_trader", "trend_following"]
+    - symbol: "IO"
+      leverage: 3
+      strategies: ["momentum", "cycle_trader", "mean_reversion"]
+    - symbol: "kPEPE"
+      leverage: 3
+      strategies: ["momentum", "cycle_trader", "breakout"]
+    - symbol: "HYPE"
+      leverage: 3
+      strategies: ["momentum", "cycle_trader", "breakout"]
+    - symbol: "DOGE"
+      leverage: 3
+      strategies: ["momentum", "cycle_trader", "mean_reversion"]
+    - symbol: "SUI"
+      leverage: 3
+      strategies: ["momentum", "cycle_trader", "breakout"]
 
 strategies:
   trend_following:
     enabled: true
-    timeframe: "1h"
+    timeframe: "15m"
     ema_periods: [20, 50, 200]
   mean_reversion:
     enabled: true
@@ -36,16 +63,50 @@ strategies:
     bb_std: 2.0
   breakout:
     enabled: true
-    timeframe: "1h"
+    timeframe: "15m"
     volume_multiplier: 1.5
     lookback_period: 20
   scalping:
-    enabled: false
+    enabled: false                # desactive - les frais mangent les profits
     timeframe: "5m"
     ema_fast: 5
     ema_slow: 13
     tp_pct: 0.5
     sl_pct: 0.3
+  grid_trading:
+    enabled: false                # desactive - trop de positions en range
+    timeframe: "15m"
+    grid_levels: 5
+    bb_period: 20
+    bb_std: 2.0
+  swing_range:
+    enabled: false                # desactive - double avec cycle_trader
+    timeframe: "15m"
+    lookback_days: 30
+    entry_zone_pct: 25
+    min_daily_range_pct: 1.5
+  momentum:
+    enabled: true
+    timeframe: "15m"
+    ema_fast: 9
+    ema_slow: 21
+    momentum_pct: 2.0
+    lookback_candles: 6
+    rsi_min_buy: 45
+    rsi_max_buy: 68
+    rsi_min_sell: 32
+    rsi_max_sell: 55
+  cycle_trader:
+    enabled: true
+    timeframe: "1d"               # bougies JOURNALIERES (500 jours de data!)
+    lookback_days: 45             # analyse 45 jours de cycles passes
+    min_cycles: 4                 # minimum 4 cycles complets pour etre fiable
+    min_reliability: 40           # fiabilite minimum 40% pour trader
+    duration_threshold: 0.8       # achete quand 80% du cycle baissier est fait
+    amplitude_proximity: 0.65     # achete quand la baisse atteint 65% de la baisse moyenne
+    min_swing_pct: 1.0            # ignore les mouvements < 1% (bruit)
+    rsi_buy_max: 45               # RSI < 45 pour acheter (bas du cycle)
+    rsi_sell_min: 55              # RSI > 55 pour shorter (haut du cycle)
 
 dashboard:
   enabled: true
