@@ -646,14 +646,33 @@ class TradingBot:
         filled_order = self._order_manager.place_order(order)
 
         if filled_order.fill_price:
+            fill = filled_order.fill_price
+
+            # SL de sécurité à -5% sur l'exchange (protection si le bot plante)
+            # Le trailing stop interne gère la sortie normale avant ce niveau
+            safety_sl_pct = 0.05
+            if side == OrderSide.BUY:
+                safety_sl = round(fill * (1 - safety_sl_pct), 6)
+            else:
+                safety_sl = round(fill * (1 + safety_sl_pct), 6)
+
+            sl_oid, _ = self._order_manager.place_tp_sl(
+                symbol, side, filled_order.size or size, safety_sl, None
+            )
+            if sl_oid:
+                logger.info(f"SL sécurité placé sur exchange: {symbol} SL={safety_sl} (oid={sl_oid})")
+            else:
+                logger.warning(f"Impossible de placer le SL sécurité pour {symbol}")
+
             position = Position(
                 symbol=symbol,
                 side=side,
                 size=size,
-                entry_price=filled_order.fill_price,
+                entry_price=fill,
                 leverage=leverage,
                 is_perp=is_perp,
                 strategy_name=strategy.name,
+                sl_order_id=sl_oid,
             )
             self._position_manager.open_position(position)
 
