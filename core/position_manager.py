@@ -27,6 +27,9 @@ class Position:
     strategy_name: str = ""
     opened_at: float = field(default_factory=time.time)
     position_id: str = ""
+    sl_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
+    peak_price: float = 0.0  # highest price seen for longs, lowest for shorts
 
     @property
     def pnl_pct(self) -> float:
@@ -43,20 +46,63 @@ class Position:
 class PositionManager:
     """Manages open positions and monitors stop-loss/take-profit."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_per_symbol: int = 1,
+        cooldown_minutes: int = 30,
+        trailing_stop_pct: float = 1.5,
+    ) -> None:
         self._positions: dict[str, Position] = {}
         self._closed_positions: list[dict] = []
+        self._max_per_symbol = max_per_symbol
+        self._cooldown_seconds = cooldown_minutes * 60
+        self._trailing_stop_pct = trailing_stop_pct  # % sous le pic pour activer la sortie
+        self._position_counter = 0
+        self._last_trade_time: dict[str, float] = {}
+
+    def _next_key(self, symbol: str, strategy_name: str) -> str:
+        """Generate a unique position key."""
+        self._position_counter += 1
+        return f"{symbol}_{strategy_name}_{self._position_counter}"
 
     def open_position(self, position: Position) -> None:
         """Register a new open position."""
-        key = f"{position.symbol}_{position.strategy_name}"
+        key = self._next_key(position.symbol, position.strategy_name)
         position.position_id = key
+        position.peak_price = position.entry_price
         self._positions[key] = position
+        self._last_trade_time[position.symbol] = time.time()
         logger.info(
             f"Position opened: {position.symbol} {position.side.value} "
             f"size={position.size} entry={position.entry_price} "
-            f"SL={position.stop_loss} TP={position.take_profit}"
+            f"SL={position.stop_loss} TP={position.take_profit} "
+            f"trailing={self._trailing_stop_pct}% "
+            f"(id={key})"
         )
+
+    def can_open_for_symbol(self, symbol: str, strategy_name: str = "") -> bool:
+        """Check if we can open a new position for this symbol.
+
+        Checks:
+        1. Not exceeding max positions per symbol.
+        2. GLOBAL cooldown since last trade on this symbol (any strategy).
+        """
+        symbol_count = sum(
+            1 for p in self._positions.values() if p.symbol == symbol
+        )
+        if symbol_count >= self._max_per_symbol:
+            return False
+
+        now = time.time()
+        last_trade = self._last_trade_time.get(symbol, 0)
+        if (now - last_trade) < self._cooldown_seconds:
+            return False
+
+        return True
+
+    def get_symbol_position_count(self, symbol: str) -> int:
+        """Count open positions for a symbol."""
+        return sum(1 for p in self._positions.values() if p.symbol == symbol)
 
     def close_position(
         self, position_id: str, exit_price: float, reason: str = ""
@@ -67,12 +113,13 @@ class PositionManager:
             logger.warning(f"Position not found: {position_id}")
             return None
 
+        # Cooldown redémarre à la fermeture (pas à l'ouverture)
+        self._last_trade_time[position.symbol] = time.time()
+
         if position.side == OrderSide.BUY:
             pnl = (exit_price - position.entry_price) * position.size
         else:
             pnl = (position.entry_price - exit_price) * position.size
-
-        pnl *= position.leverage
 
         result = {
             "symbol": position.symbol,
@@ -98,12 +145,18 @@ class PositionManager:
         )
         return result
 
-    def update_prices(self, prices: dict[str, float]) -> list[str]:
-        """Update unrealized PnL and check SL/TP triggers.
+    def update_prices(
+        self, prices: dict[str, float]
+    ) -> tuple[list[str], list[str]]:
+        """Update unrealized PnL, trailing stops, and check SL/TP triggers.
 
-        Returns list of position IDs that hit SL or TP.
+        Returns:
+            Tuple of (triggered_ids, sl_updated_ids).
+            - triggered_ids: positions that hit SL or TP.
+            - sl_updated_ids: positions whose trailing SL moved (need exchange update).
         """
         triggered: list[str] = []
+        sl_updated: list[str] = []
 
         for pos_id, pos in list(self._positions.items()):
             current_price = prices.get(pos.symbol)
@@ -112,12 +165,67 @@ class PositionManager:
 
             if pos.side == OrderSide.BUY:
                 pos.unrealized_pnl = (
-                    (current_price - pos.entry_price) * pos.size * pos.leverage
+                    (current_price - pos.entry_price) * pos.size
                 )
             else:
                 pos.unrealized_pnl = (
-                    (pos.entry_price - current_price) * pos.size * pos.leverage
+                    (pos.entry_price - current_price) * pos.size
                 )
+
+            # Calculate profit percentage for this position
+            if pos.entry_price > 0:
+                if pos.side == OrderSide.BUY:
+                    profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+                else:
+                    profit_pct = ((pos.entry_price - current_price) / pos.entry_price) * 100
+            else:
+                profit_pct = 0.0
+
+            # Emergency exit: close if leveraged loss exceeds 5%
+            if profit_pct < 0 and abs(profit_pct) >= 5.0:
+                logger.warning(
+                    f"Emergency exit {pos.symbol}: loss={abs(profit_pct):.1f}%"
+                )
+                triggered.append(pos_id)
+                continue
+
+            # Trailing stop: % fixe sous/sur le pic atteint, activé après 2% de profit
+            # (activation tardive pour laisser le trade respirer et éviter stopouts sur bruit)
+            # Exemple: trailing 3% -> si BTC monte à 80000, SL = 80000 * 0.97 = 77600
+            if profit_pct >= 2.0 and self._trailing_stop_pct > 0:
+                trail_mult = self._trailing_stop_pct / 100.0
+                if pos.side == OrderSide.BUY:
+                    # Mettre à jour le pic le plus haut atteint
+                    if current_price > pos.peak_price:
+                        pos.peak_price = current_price
+                    # SL = pic - trailing%
+                    trailing_sl = round(pos.peak_price * (1 - trail_mult), 6)
+                    if pos.stop_loss is None or trailing_sl > pos.stop_loss:
+                        old_sl = pos.stop_loss
+                        pos.stop_loss = trailing_sl
+                        if old_sl is None or abs(trailing_sl - old_sl) / old_sl > 0.005:
+                            sl_updated.append(pos_id)
+                            logger.info(
+                                f"Trailing SL {pos.symbol}: "
+                                f"pic=${pos.peak_price:.2f} -> SL=${trailing_sl:.2f} "
+                                f"({self._trailing_stop_pct}% sous le pic)"
+                            )
+                else:
+                    # SHORT: on suit le prix le plus bas atteint
+                    if pos.peak_price == pos.entry_price or current_price < pos.peak_price:
+                        pos.peak_price = current_price
+                    # SL = creux + trailing%
+                    trailing_sl = round(pos.peak_price * (1 + trail_mult), 6)
+                    if pos.stop_loss is None or trailing_sl < pos.stop_loss:
+                        old_sl = pos.stop_loss
+                        pos.stop_loss = trailing_sl
+                        if old_sl is None or abs(trailing_sl - old_sl) / old_sl > 0.005:
+                            sl_updated.append(pos_id)
+                            logger.info(
+                                f"Trailing SL {pos.symbol}: "
+                                f"creux=${pos.peak_price:.2f} -> SL=${trailing_sl:.2f} "
+                                f"({self._trailing_stop_pct}% sur le creux)"
+                            )
 
             # Check stop-loss
             if pos.stop_loss:
@@ -137,7 +245,17 @@ class PositionManager:
                     triggered.append(pos_id)
                     continue
 
-        return triggered
+            # Time-based exit: close after 24h if not profitable
+            age_hours = (time.time() - pos.opened_at) / 3600
+            if age_hours >= 24 and profit_pct <= 0:
+                logger.info(
+                    f"Time exit {pos.symbol}: open {age_hours:.0f}h, "
+                    f"PnL={profit_pct:.1f}%"
+                )
+                triggered.append(pos_id)
+                continue
+
+        return triggered, sl_updated
 
     def get_position(self, position_id: str) -> Optional[Position]:
         return self._positions.get(position_id)

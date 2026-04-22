@@ -1,0 +1,10 @@
+# Paramètres gérés par le bot — ne pas modifier manuellement
+# Ce fichier écrase config.yaml sans le toucher
+
+risk:
+  trailing_stop_pct: 2.0        # trailing 2% sous le pic
+  max_positions_per_symbol: 1   # 1 position par crypto max
+
+strategies:
+  cycle_trader:
+    enabled: false              # désactivé temporairement (fiabilité trop faible)

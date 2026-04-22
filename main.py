@@ -56,13 +56,26 @@ logger.add(
 
 
 def load_config() -> dict:
-    """Load configuration from config.yaml."""
+    """Load config.yaml then merge config.local.yaml on top (bot overrides)."""
     config_path = Path(__file__).parent / "config.yaml"
     if not config_path.exists():
         logger.error("config.yaml not found")
         sys.exit(1)
     with open(config_path) as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+
+    local_path = Path(__file__).parent / "config.local.yaml"
+    if local_path.exists():
+        with open(local_path) as f:
+            local = yaml.safe_load(f) or {}
+        for section, values in local.items():
+            if isinstance(values, dict) and isinstance(config.get(section), dict):
+                config[section].update(values)
+            else:
+                config[section] = values
+        logger.info("config.local.yaml chargé (overrides actifs)")
+
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +101,13 @@ class TradingBot:
         testnet = os.getenv("HL_TESTNET", "true").lower() == "true"
         self._client = HyperliquidClient(testnet=testnet)
         self._order_manager = OrderManager(self._client, paper_mode=self._paper_mode)
-        self._position_manager = PositionManager()
+        # Position manager: allow multiple positions per crypto
+        risk_cfg_pos = config.get("risk", {})
+        self._position_manager = PositionManager(
+            max_per_symbol=risk_cfg_pos.get("max_positions_per_symbol", 1),
+            cooldown_minutes=risk_cfg_pos.get("cooldown_minutes", 30),
+            trailing_stop_pct=risk_cfg_pos.get("trailing_stop_pct", 1.5),
+        )
         self._portfolio = Portfolio(initial_capital=10_000.0)
 
         # Risk
@@ -162,6 +181,46 @@ class TradingBot:
         # Connect to exchange
         self._client.connect()
 
+        # Fetch real balance in live mode
+        if not self._paper_mode and self._client.is_connected:
+            try:
+                real_balance = 0.0
+
+                # Check Perps balance
+                user_state = self._client.get_user_state()
+                if user_state:
+                    margin = user_state.get("marginSummary", {})
+                    real_balance = float(margin.get("accountValue", 0))
+
+                # Check Spot balance (USDC)
+                spot_balance = 0.0
+                spot_balances = self._client.get_spot_balances()
+                for bal in spot_balances:
+                    if bal.get("coin") == "USDC":
+                        spot_balance = float(bal.get("total", 0))
+                        break
+
+                total = real_balance + spot_balance
+                logger.info(f"Perps balance: ${real_balance:,.2f} | Spot USDC: ${spot_balance:,.2f} | Total: ${total:,.2f}")
+
+                if total > 0:
+                    self._portfolio = Portfolio(initial_capital=total)
+                    risk_cfg = self._config.get("risk", {})
+                    self._risk_manager = RiskManager(
+                        RiskConfig(
+                            max_risk_per_trade_pct=risk_cfg.get("max_risk_per_trade_pct", 1.0),
+                            max_drawdown_pct=risk_cfg.get("max_drawdown_pct", 10.0),
+                            max_open_positions=risk_cfg.get("max_open_positions", 5),
+                            min_reward_risk_ratio=risk_cfg.get("min_reward_risk_ratio", 2.0),
+                        ),
+                        initial_capital=total,
+                    )
+                    logger.info(f"Real balance loaded: ${total:,.2f}")
+                else:
+                    logger.warning("Account balance is 0 - check your wallet")
+            except Exception as e:
+                logger.error(f"Failed to load balance: {e}")
+
         # Share state with dashboard
         set_bot_state(self._get_bot_state())
 
@@ -175,6 +234,9 @@ class TradingBot:
             )
             dash_thread.start()
             logger.info(f"Dashboard available at http://localhost:{port}")
+
+        # Validate trading pairs against available symbols
+        self._validate_trading_pairs()
 
         # Main trading loop
         self._running = True
@@ -191,6 +253,34 @@ class TradingBot:
             self._running = False
             logger.info("Bot stopped")
 
+    def _validate_trading_pairs(self) -> None:
+        """Check which configured symbols are available on the exchange.
+
+        Removes unavailable symbols and logs warnings.
+        """
+        available = self._feed.get_available_symbols()
+        if not available:
+            logger.warning("Could not fetch available symbols - skipping validation")
+            return
+
+        logger.info(f"Exchange has {len(available)} available symbols")
+
+        valid_pairs = []
+        for pair in self._trading_pairs:
+            symbol = pair["symbol"]
+            if symbol in available:
+                valid_pairs.append(pair)
+            else:
+                logger.warning(
+                    f"Symbol '{symbol}' not found on exchange - removing from trading pairs. "
+                    f"Available similar: {[s for s in available if symbol.lower() in s.lower()]}"
+                )
+
+        removed = len(self._trading_pairs) - len(valid_pairs)
+        if removed > 0:
+            logger.info(f"Removed {removed} unavailable pairs, {len(valid_pairs)} pairs active")
+        self._trading_pairs = valid_pairs
+
     def _run_loop(self) -> None:
         """Main trading loop."""
         while self._running:
@@ -199,14 +289,6 @@ class TradingBot:
                 self._tick()
                 # Update shared state for dashboard
                 set_bot_state(self._get_bot_state())
-
-                # Broadcast updates via WebSocket (fire and forget)
-                try:
-                    loop = asyncio.new_event_loop()
-                    loop.run_until_complete(self._broadcast_updates())
-                    loop.close()
-                except Exception:
-                    pass
 
                 elapsed = time.time() - loop_start
                 sleep_time = max(0, self._update_interval - elapsed)
@@ -222,14 +304,46 @@ class TradingBot:
         # 1. Update prices
         prices = self._feed.get_current_prices()
         if not prices:
-            logger.debug("No price data available")
+            logger.warning("No price data available - check connection")
             return
 
-        # 2. Check SL/TP triggers
-        triggered = self._position_manager.update_prices(prices)
+        # Log key prices
+        tracked_symbols = [p["symbol"] for p in self._trading_pairs]
+        price_info = {s: f"${prices[s]:,.2f}" for s in tracked_symbols if s in prices}
+        logger.info(f"Prices: {price_info}")
+
+        # 2. Check SL/TP triggers and trailing stop updates
+        triggered, sl_updated = self._position_manager.update_prices(prices)
+
+        # Handle positions whose trailing SL moved -> update on exchange
+        for pos_id in sl_updated:
+            pos = self._position_manager.get_position(pos_id)
+            if pos and pos.stop_loss:
+                new_oid = self._order_manager.update_stop_loss(
+                    pos.symbol, pos.side, pos.size,
+                    pos.sl_order_id, pos.stop_loss,
+                )
+                if new_oid:
+                    pos.sl_order_id = new_oid
+                    logger.info(
+                        f"Trailing SL updated on exchange: {pos.symbol} "
+                        f"new SL={pos.stop_loss}"
+                    )
+
+        # Handle triggered SL/TP
         for pos_id in triggered:
             pos = self._position_manager.get_position(pos_id)
             if pos:
+                # Cancel remaining TP or SL order on exchange
+                if pos.tp_order_id:
+                    self._order_manager.cancel_trigger_order(
+                        pos.symbol, pos.tp_order_id
+                    )
+                if pos.sl_order_id:
+                    self._order_manager.cancel_trigger_order(
+                        pos.symbol, pos.sl_order_id
+                    )
+
                 exit_price = prices.get(pos.symbol, pos.entry_price)
                 result = self._position_manager.close_position(
                     pos_id, exit_price, reason="sl_tp_triggered"
@@ -242,65 +356,260 @@ class TradingBot:
                     if strategy:
                         strategy.record_result(won)
 
+        # 2b. Sync positions from exchange and verify SL/TP
+        if not self._paper_mode and self._client.is_connected:
+            self._sync_and_protect_positions(prices)
+
         # 3. Update portfolio
         self._portfolio.check_new_day()
         unrealized = self._position_manager.get_total_unrealized_pnl()
         self._portfolio.update_paper(unrealized)
-        self._risk_manager.update_capital(self._portfolio.total_value)
+        # Peak base sur paper_balance (realise) pour eviter fausses drawdowns
+        # causees par les spikes de PnL flottant
+        self._risk_manager.update_capital(
+            self._portfolio.total_value,
+            realized_capital=self._portfolio.paper_balance,
+        )
 
         # 4. Check if risk halt
         if self._risk_manager.is_halted:
             logger.warning("Trading halted by risk manager")
             return
 
+    def _sync_and_protect_positions(self, prices: dict[str, float]) -> None:
+        """Sync positions from exchange and ensure every position has SL/TP.
+
+        Runs every tick in live mode. If a position exists on the exchange
+        but has no SL/TP orders, it places them automatically.
+        """
+        try:
+            from indicators.volatility import atr as calc_atr
+
+            user_state = self._client.get_user_state()
+            if not user_state:
+                return
+
+            open_orders = self._client.get_frontend_open_orders()
+            protected_symbols = set()
+            for order in open_orders:
+                coin = order.get("coin", "")
+                otype = str(order.get("orderType", "")).lower()
+                # Trigger orders = SL/TP protection
+                if any(k in otype for k in ["trigger", "stop", "take", "tp", "sl"]):
+                    protected_symbols.add(coin)
+                # Also check by reduceOnly flag (SL/TP are always reduce-only)
+                if order.get("reduceOnly", False):
+                    protected_symbols.add(coin)
+
+            exchange_positions = user_state.get("assetPositions", [])
+            for pos_data in exchange_positions:
+                position = pos_data.get("position", {})
+                symbol = position.get("coin", "")
+                size = float(position.get("szi", 0))
+                if size == 0 or not symbol:
+                    continue
+
+                entry_price = float(position.get("entryPx", 0))
+                leverage_data = position.get("leverage", {})
+                leverage = int(leverage_data.get("value", 1))
+                is_long = size > 0
+                abs_size = abs(size)
+                side = OrderSide.BUY if is_long else OrderSide.SELL
+
+                # Sync to position_manager for trailing stop
+                sync_key = f"{symbol}_exchange"
+                if not self._position_manager.get_position(sync_key):
+                    synced_pos = Position(
+                        symbol=symbol,
+                        side=side,
+                        size=abs_size,
+                        entry_price=entry_price,
+                        leverage=leverage,
+                        is_perp=True,
+                        strategy_name="exchange",
+                        position_id=sync_key,
+                    )
+                    synced_pos.peak_price = entry_price
+                    self._position_manager._positions[sync_key] = synced_pos
+                    logger.info(
+                        f"Synced {symbol} from exchange for trailing stop: "
+                        f"{side.value} size={abs_size} entry={entry_price} {leverage}x"
+                    )
+
+                # Trailing stop géré en interne — pas de SL/TP fixe sur exchange
+                    logger.info(
+                        f"Auto-protection placed for {symbol}: "
+                        f"SL={sl_price} (oid={sl_oid}) "
+                        f"TP={tp_price} (oid={tp_oid})"
+                    )
+                else:
+                    logger.error(
+                        f"FAILED to place SL/TP for {symbol}! "
+                        f"Position is UNPROTECTED"
+                    )
+
+        except Exception as e:
+            logger.error(f"Sync/protect error: {e}")
+
         # 5. Run strategies for each trading pair
         for pair in self._trading_pairs:
             self._process_pair(pair, prices)
 
     def _process_pair(self, pair: dict, prices: dict[str, float]) -> None:
-        """Process strategies for a single trading pair."""
+        """Process strategies for a single trading pair using consensus.
+
+        All strategies vote first, then only open a position if 2+ agree.
+        This prevents 5 separate positions on the same symbol.
+        """
         symbol = pair["symbol"]
         is_perp = pair["is_perp"]
         leverage = pair["leverage"]
         pair_strategies = pair["strategies"]
+
+        if not self._position_manager.can_open_for_symbol(symbol):
+            return
+
+        if not self._risk_manager.can_open_position(
+            self._position_manager.open_count
+        ):
+            return
+
+        from strategies.strategy_manager import CONFIRMATION_TIMEFRAMES
+
+        buy_votes: list[tuple[str, int]] = []
+        sell_votes: list[tuple[str, int]] = []
+        best_strategy_name = None
+        best_confidence = 0
 
         for strategy_name in pair_strategies:
             strategy = self._strategy_manager.get_strategy(strategy_name)
             if not strategy or not strategy.enabled:
                 continue
 
-            # Check if already in position for this symbol+strategy
-            pos_key = f"{symbol}_{strategy_name}"
-            if self._position_manager.get_position(pos_key):
-                continue
-
-            # Check risk limits
-            if not self._risk_manager.can_open_position(
-                self._position_manager.open_count
-            ):
-                continue
-
-            # Get market data
             df = self._cache.get_or_fetch(
                 symbol, strategy.timeframe, self._feed.get_ohlcv
             )
             if df.empty:
                 continue
 
-            # Generate signal
-            signal = self._strategy_manager.run_strategy(strategy_name, df)
+            htf = CONFIRMATION_TIMEFRAMES.get(strategy.timeframe)
+            higher_tf_df = None
+            if htf:
+                higher_tf_df = self._cache.get_or_fetch(
+                    symbol, htf, self._feed.get_ohlcv
+                )
+
+            signal, confidence = self._strategy_manager.run_with_confirmation(
+                strategy_name, df, higher_tf_df, symbol
+            )
+            logger.info(
+                f"[{strategy_name}] {symbol} ({strategy.timeframe}) -> "
+                f"{signal.value if signal else 'ERROR'} "
+                f"(confidence={confidence}%)"
+            )
             if signal is None or signal == Signal.HOLD:
                 continue
 
-            # Record strategy run
+            # Filtre contagion : bloquer breakout sur altcoins si BTC a pumpé >1% dans la dernière heure
+            if strategy_name == "breakout" and symbol != "BTC":
+                btc_df = self._cache.get_or_fetch("BTC", "1h", self._feed.get_ohlcv)
+                if not btc_df.empty and len(btc_df) >= 2:
+                    btc_last = float(btc_df["close"].iloc[-1])
+                    btc_prev = float(btc_df["close"].iloc[-2])
+                    btc_move_pct = abs((btc_last - btc_prev) / btc_prev) * 100
+                    if btc_move_pct >= 1.0:
+                        logger.info(
+                            f"[breakout] {symbol} signal bloqué — contagion BTC "
+                            f"({btc_move_pct:.2f}% en 1h)"
+                        )
+                        continue
+
             self._repository.save_strategy_run(
                 strategy_name, symbol, strategy.timeframe, signal.value
             )
 
-            # Execute signal
-            self._execute_signal(
-                signal, symbol, strategy, df, is_perp, leverage
-            )
+            if signal == Signal.BUY:
+                buy_votes.append((strategy_name, confidence))
+            elif signal == Signal.SELL:
+                sell_votes.append((strategy_name, confidence))
+
+        chosen_signal = None
+        votes = []
+
+        # 2+ strategies agree = trade (any confidence)
+        # OR 1 strategy with confidence >= 60% = trade alone
+        if len(buy_votes) >= 2 and len(buy_votes) >= len(sell_votes):
+            chosen_signal = Signal.BUY
+            votes = buy_votes
+        elif len(sell_votes) >= 2:
+            chosen_signal = Signal.SELL
+            votes = sell_votes
+        elif len(buy_votes) == 1 and buy_votes[0][1] >= 60:
+            chosen_signal = Signal.BUY
+            votes = buy_votes
+        elif len(sell_votes) == 1 and sell_votes[0][1] >= 60:
+            chosen_signal = Signal.SELL
+            votes = sell_votes
+
+        if chosen_signal is None:
+            all_votes = buy_votes + sell_votes
+            if all_votes:
+                logger.debug(
+                    f"[CONSENSUS] {symbol}: pas assez de votes - "
+                    f"BUY={[(n, c) for n, c in buy_votes]} "
+                    f"SELL={[(n, c) for n, c in sell_votes]}"
+                )
+            return
+
+        best_strategy_name = max(votes, key=lambda x: x[1])[0]
+        avg_confidence = sum(c for _, c in votes) // len(votes)
+        strategy = self._strategy_manager.get_strategy(best_strategy_name)
+
+        logger.info(
+            f"[CONSENSUS] {symbol} {chosen_signal.value} confirmed by "
+            f"{len(votes)} strategies: {[v[0] for v in votes]} "
+            f"(avg confidence={avg_confidence}%)"
+        )
+
+        df = self._cache.get_or_fetch(
+            symbol, strategy.timeframe, self._feed.get_ohlcv
+        )
+
+        actual_leverage = self._calculate_leverage(
+            leverage, avg_confidence, is_perp
+        )
+
+        self._execute_signal(
+            chosen_signal, symbol, strategy, df, is_perp, actual_leverage
+        )
+
+    def _calculate_leverage(
+        self, base_leverage: int, confidence: int, is_perp: bool
+    ) -> int:
+        """Calculate dynamic leverage based on signal confidence.
+
+        Conservative tiers:
+            85-100% -> base leverage from config (3x)
+            70-84%  -> base leverage (3x)
+            50-69%  -> reduced (2x)
+            <50%    -> minimum (1x)
+
+        Only applies to perps. Spot always uses 1x.
+        """
+        if not is_perp:
+            return 1
+
+        if confidence >= 70:
+            lev = base_leverage
+        elif confidence >= 50:
+            lev = max(1, base_leverage - 1)
+        else:
+            lev = 1
+
+        logger.info(
+            f"Leverage: confidence={confidence}% -> {lev}x (base={base_leverage}x)"
+        )
+        return lev
 
     def _execute_signal(
         self,
@@ -327,31 +636,19 @@ class TradingBot:
         side_str = "buy" if signal == Signal.BUY else "sell"
         side = OrderSide.BUY if signal == Signal.BUY else OrderSide.SELL
 
-        # Calculate SL/TP
-        sl = strategy.get_stop_loss(current_price, current_atr, side_str)
-        tp = strategy.get_take_profit(current_price, current_atr, side_str)
-
-        # Validate risk
-        if not self._risk_manager.validate_stop_loss(current_price, sl, side_str):
-            return
-        if not self._risk_manager.validate_reward_risk(current_price, sl, tp):
-            return
-
-        # Calculate position size
-        size = self._risk_manager.calculate_position_size(
-            current_price, sl, leverage
-        )
+        # Taille basée sur risk_pct% du capital (pas de SL fixe)
+        risk_pct = self._risk_manager._config.max_risk_per_trade_pct / 100.0
+        capital = self._risk_manager._current_capital
+        size = round((capital * risk_pct) / current_price, 6)
         if size <= 0:
             return
 
-        # Place order
+        # Ordre sans SL/TP fixe — trailing stop géré en interne (activé à +3%, trail 2%)
         order = Order(
             symbol=symbol,
             side=side,
             size=size,
             order_type=OrderType.MARKET,
-            stop_loss=sl,
-            take_profit=tp,
             leverage=leverage,
             is_perp=is_perp,
         )
@@ -359,7 +656,6 @@ class TradingBot:
         filled_order = self._order_manager.place_order(order)
 
         if filled_order.fill_price:
-            # Record position
             position = Position(
                 symbol=symbol,
                 side=side,
@@ -367,8 +663,6 @@ class TradingBot:
                 entry_price=filled_order.fill_price,
                 leverage=leverage,
                 is_perp=is_perp,
-                stop_loss=sl,
-                take_profit=tp,
                 strategy_name=strategy.name,
             )
             self._position_manager.open_position(position)
