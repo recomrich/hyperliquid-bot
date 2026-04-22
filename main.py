@@ -437,16 +437,6 @@ class TradingBot:
                     )
 
                 # Trailing stop géré en interne — pas de SL/TP fixe sur exchange
-                    logger.info(
-                        f"Auto-protection placed for {symbol}: "
-                        f"SL={sl_price} (oid={sl_oid}) "
-                        f"TP={tp_price} (oid={tp_oid})"
-                    )
-                else:
-                    logger.error(
-                        f"FAILED to place SL/TP for {symbol}! "
-                        f"Position is UNPROTECTED"
-                    )
 
         except Exception as e:
             logger.error(f"Sync/protect error: {e}")
