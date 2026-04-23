@@ -3,12 +3,15 @@
 Basée sur des bougies 1h pour filtrer le bruit des 15m.
 Conditions strictes pour éviter les faux signaux en range.
 
-BUY:  Prix > EMA200 + EMA20 > EMA50 + MACD croise à la hausse + RSI 40-65
-SELL: Prix < EMA200 + EMA20 < EMA50 + MACD croise à la baisse + RSI 35-60
+BUY:  Prix > EMA200 + EMA20 > EMA50 + MACD croise à la hausse + RSI 45-60
+SELL: Prix < EMA200 + EMA20 < EMA50 + MACD croise à la baisse + RSI 35-55
+
+Filtre horaire (UTC) : évite 08h, 15h, 18h (statistiquement perdants sur BTC).
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import pandas as pd
 from loguru import logger
 
@@ -25,13 +28,19 @@ class BtcTrendStrategy(BaseStrategy):
         timeframe = params.get("timeframe", "1h")
         super().__init__("btc_trend", timeframe, params)
         self._ema_periods = params.get("ema_periods", [20, 50, 200])
-        self._rsi_buy_min = params.get("rsi_buy_min", 40)
-        self._rsi_buy_max = params.get("rsi_buy_max", 65)
+        self._rsi_buy_min = params.get("rsi_buy_min", 45)
+        self._rsi_buy_max = params.get("rsi_buy_max", 60)
         self._rsi_sell_min = params.get("rsi_sell_min", 35)
-        self._rsi_sell_max = params.get("rsi_sell_max", 60)
+        self._rsi_sell_max = params.get("rsi_sell_max", 55)
+        self._bad_hours_utc = params.get("bad_hours_utc", [8, 15, 18])
 
     def generate_signal(self, df: pd.DataFrame) -> Signal:
         if len(df) < max(self._ema_periods) + 10:
+            return Signal.HOLD
+
+        # Filtre horaire : heures statistiquement perdantes sur BTC (UTC)
+        current_hour = datetime.now(timezone.utc).hour
+        if current_hour in self._bad_hours_utc:
             return Signal.HOLD
 
         data = add_trend_indicators(df, self._ema_periods)

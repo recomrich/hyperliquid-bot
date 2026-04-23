@@ -13,7 +13,8 @@ strategies:
     enabled: true
     timeframe: "1h"
     ema_periods: [20, 50, 200]
-    rsi_buy_min: 40
-    rsi_buy_max: 65
+    rsi_buy_min: 45
+    rsi_buy_max: 60
     rsi_sell_min: 35
-    rsi_sell_max: 60
+    rsi_sell_max: 55
+    bad_hours_utc: [8, 15, 18]
