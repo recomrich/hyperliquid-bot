@@ -32,6 +32,7 @@ class Portfolio:
         self._perps_value = 0.0
         self._unrealized_pnl = 0.0
         self._realized_pnl = 0.0
+        self._daily_pnl_from_db = 0.0
         self._daily_start_value = initial_capital
         self._daily_start_time = time.time()
         self._snapshots: list[PortfolioSnapshot] = []
@@ -117,13 +118,15 @@ class Portfolio:
 
     @property
     def daily_pnl(self) -> float:
-        return self._total_value - self._daily_start_value
+        # PnL 24h depuis DB + trades de la session en cours
+        session_pnl = sum(t.get("pnl", 0) for t in self._trade_results)
+        return round(self._daily_pnl_from_db + session_pnl, 4)
 
     @property
     def daily_pnl_pct(self) -> float:
         if self._daily_start_value == 0:
             return 0.0
-        return (self.daily_pnl / self._daily_start_value) * 100
+        return round((self.daily_pnl / self._daily_start_value) * 100, 2)
 
     @property
     def total_pnl(self) -> float:

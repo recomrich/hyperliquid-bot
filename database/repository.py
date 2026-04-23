@@ -86,6 +86,23 @@ class Repository:
                 for t in trades
             ]
 
+    def get_total_realized_pnl(self) -> float:
+        """PnL total réalisé sur tous les trades en base."""
+        with self._session() as session:
+            trades = session.query(TradeRecord).all()
+            return round(sum(t.pnl for t in trades if t.pnl), 4)
+
+    def get_daily_realized_pnl(self) -> float:
+        """PnL réalisé des dernières 24h."""
+        since = datetime.utcnow() - timedelta(hours=24)
+        with self._session() as session:
+            trades = (
+                session.query(TradeRecord)
+                .filter(TradeRecord.closed_at >= since)
+                .all()
+            )
+            return round(sum(t.pnl for t in trades if t.pnl), 4)
+
     def get_strategy_stats(self, strategy_name: str) -> dict:
         """Get performance stats for a specific strategy."""
         with self._session() as session:

@@ -215,7 +215,12 @@ class TradingBot:
                         ),
                         initial_capital=total,
                     )
-                    logger.info(f"Real balance loaded: ${total:,.2f}")
+                    # Restaurer PnL depuis la base de données (survit aux redémarrages)
+                    total_pnl = self._repository.get_total_realized_pnl()
+                    daily_pnl = self._repository.get_daily_realized_pnl()
+                    self._portfolio._realized_pnl = total_pnl
+                    self._portfolio._daily_pnl_from_db = daily_pnl
+                    logger.info(f"Real balance loaded: ${total:,.2f} | PnL total: ${total_pnl:+.2f} | PnL 24h: ${daily_pnl:+.2f}")
                 else:
                     logger.warning("Account balance is 0 - check your wallet")
             except Exception as e:
